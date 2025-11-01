@@ -20,6 +20,106 @@ import cv2
 import numpy as np
 import re
 import math
+# --- NEW: imports ---
+import uuid
+from datetime import datetime, timezone
+
+# --- NEW: Telemetry logger -----------------------------------------------
+class _TelemetryLogger:
+    """
+    Lightweight session & function timing logger that writes a single JSON per run.
+    Usage:
+        self.logger.begin_session(log_dir)
+        with self.logger.timer("manual_annotation", extra={...}):
+            ...
+        self.logger.end_session()
+    """
+    def __init__(self, log_dir=None):
+        self.session_id = None
+        self.started_at = None
+        self.ended_at = None
+        self.events = []
+        self.totals = {}
+        self.log_dir = log_dir
+        self._outfile = None
+
+    def _now_iso(self):
+        return datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+
+    def begin_session(self, log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+        self.log_dir = log_dir
+        self.session_id = uuid.uuid4().hex
+        self.started_at = self._now_iso()
+        # use local time for the filename stamp for readability
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._outfile = os.path.join(log_dir, f"session_{stamp}_{self.session_id[:6]}.json")
+        self._flush()  # create the file early
+
+    def end_session(self):
+        self.ended_at = self._now_iso()
+        self._flush()
+
+    def _flush(self):
+        if not self._outfile:
+            return
+        payload = {
+            "session_id": self.session_id,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "totals_sec": {k: round(v, 6) for k, v in self.totals.items()},
+            "events": self.events,
+        }
+        tmp = self._outfile + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, self._outfile)
+
+    class _TimerCtx:
+        def __init__(self, parent, name, extra=None):
+            self.parent = parent
+            self.name = name
+            self.extra = extra or {}
+        def __enter__(self):
+            from time import perf_counter
+            self.t0 = perf_counter()
+            self.t0_iso = self.parent._now_iso()
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            from time import perf_counter
+            t1 = perf_counter()
+            secs = t1 - self.t0
+            evt = {
+                "name": self.name,
+                "t_start": self.t0_iso,
+                "t_end": self.parent._now_iso(),
+                "secs": round(secs, 6),
+                "extra": self.extra
+            }
+            self.parent.events.append(evt)
+            self.parent.totals[self.name] = self.parent.totals.get(self.name, 0.0) + secs
+            self.parent._flush()
+
+    def timer(self, name, extra=None):
+        return self._TimerCtx(self, name, extra)
+
+# --- NEW: helper to write per-frame meta JSON -----------------------------
+def _write_frame_meta(meta_path, directions, lane_mode, step_size, adjustment_factor, num_lanes=None, extra=None):
+    os.makedirs(os.path.dirname(meta_path), exist_ok=True)
+    payload = {
+        "num_lanes": int(num_lanes if num_lanes is not None else len(directions)),
+        "lane_mode": lane_mode,
+        "directions": list(directions),
+        "step_size": int(step_size),
+        "adjustment_factor": float(adjustment_factor),
+    }
+    if extra:
+        payload.update(extra)
+    tmp = meta_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, meta_path)
+# --------------------------------------------------------------------------
 
 def _median(arr):
     a = sorted(arr)
@@ -62,7 +162,7 @@ class HybridLabeler:
     - Generating binary segmentation masks for all frames
     """
     
-    def __init__(self, step_size=60, adjustment_factor=1.5):
+    def __init__(self, step_size=60, adjustment_factor=1.5, log_dir=None):
         """
         Initialize the hybrid labeler.
         
@@ -87,10 +187,9 @@ class HybridLabeler:
         self.last_xy = (0,0)
         self.snap_to_edge = True   # toggle with 'e' during manual mode
         self.smooth_masks = False 
+        self.logger = _TelemetryLogger(log_dir=log_dir)
+        self.log_dir = log_dir  # keep for reference
 
-
-
-    
 
     def _to_orig(self, x, y):
         zx, zy = self.zoom, self.zoom
@@ -269,105 +368,119 @@ class HybridLabeler:
 
     
     def manual_annotation(self, image, output_file):
-        self.current_points = []
-        direction = 'straight'
-        self.current_lane_mode = self.default_lane_mode  # reset per frame
-        lanes_tmp = []          # collect lanes here
-        dirs_tmp = []           # parallel directions
+        with self.logger.timer("manual_annotation", extra={"file": os.path.basename(output_file).replace(".lines.txt",".jpg")}):
 
-        self.display_scale = self._fit_scale(image)
-        img_vis = cv2.resize(image, None, fx=self.display_scale, fy=self.display_scale, interpolation=cv2.INTER_AREA)
+            self.current_points = []
+            direction = 'straight'
+            self.current_lane_mode = self.default_lane_mode  # reset per frame
+            lanes_tmp = []          # collect lanes here
+            dirs_tmp = []           # parallel directions
 
-        cv2.namedWindow("Image", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Image",
-                        min(int(image.shape[1] * self.display_scale), self.max_window_size[0]),
-                        min(int(image.shape[0] * self.display_scale), self.max_window_size[1]))
-        cv2.imshow("Image", img_vis)
-        cv2.setMouseCallback("Image", self.mouse_callback,
-                     {'img': img_vis, 'scale': self.display_scale, 'orig': image})
+            self.display_scale = self._fit_scale(image)
+            img_vis = cv2.resize(image, None, fx=self.display_scale, fy=self.display_scale, interpolation=cv2.INTER_AREA)
+
+            cv2.namedWindow("Image", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("Image",
+                            min(int(image.shape[1] * self.display_scale), self.max_window_size[0]),
+                            min(int(image.shape[0] * self.display_scale), self.max_window_size[1]))
+            cv2.imshow("Image", img_vis)
+            cv2.setMouseCallback("Image", self.mouse_callback,
+                        {'img': img_vis, 'scale': self.display_scale, 'orig': image})
 
 
-        print("Instructions:")
-        print("  - Left click: Select lane points")
-        print("  - 'k': Save current lane")
-        print("  - '1' single-lane (only one lane will be kept)")
-        print("  - '2' multi-lane (keep all)")
-        print("  - Arrow keys: Set direction (Left/Right/Up/Down, default: Straight)")
-        print("  - 'r': Redo current frame")
-        print("  - Enter: Finish and write annotations")
+            print("Instructions:")
+            print("  - Left click: Select lane points")
+            print("  - 'k': Save current lane")
+            print("  - '1' single-lane (only one lane will be kept)")
+            print("  - '2' multi-lane (keep all)")
+            print("  - Arrow keys: Set direction (Left/Right/Up/Down, default: Straight)")
+            print("  - 'r': Redo current frame")
+            print("  - Enter: Finish and write annotations")
 
-        while True:
-            key = cv2.waitKey(0) & 0xFF
+            while True:
+                key = cv2.waitKey(0) & 0xFF
 
-            if key == ord('1'):
-                self.current_lane_mode = "single"
-                print("Lane mode: SINGLE")
-            elif key == ord('2'):
-                self.current_lane_mode = "multi"
-                print("Lane mode: MULTI")
+                if key == ord('1'):
+                    self.current_lane_mode = "single"
+                    print("Lane mode: SINGLE")
+                elif key == ord('2'):
+                    self.current_lane_mode = "multi"
+                    print("Lane mode: MULTI")
 
-            elif key == ord('k'):
-                if self.current_points:
-                    if self.current_lane_mode == "single":
-                        lanes_tmp = [self.current_points.copy()]
-                        dirs_tmp  = [direction]
-                    else:
-                        lanes_tmp.append(self.current_points.copy())
-                        dirs_tmp.append(direction)
+                elif key == ord('k'):
+                    if self.current_points:
+                        if self.current_lane_mode == "single":
+                            lanes_tmp = [self.current_points.copy()]
+                            dirs_tmp  = [direction]
+                        else:
+                            lanes_tmp.append(self.current_points.copy())
+                            dirs_tmp.append(direction)
+                        self.current_points = []
+                        direction = 'straight'
+                        print(f"Saved lane. Total lanes (pending write): {len(lanes_tmp)}")
+
+                elif key == 13:  # Enter
+                    if self.current_points:
+                        if self.current_lane_mode == "single":
+                            lanes_tmp = [self.current_points.copy()]
+                            dirs_tmp  = [direction]
+                        else:
+                            lanes_tmp.append(self.current_points.copy())
+                            dirs_tmp.append(direction)
+                    break
+
+                elif key == ord('r'):
+                    print("Redoing current frame...")
                     self.current_points = []
-                    direction = 'straight'
-                    print(f"Saved lane. Total lanes (pending write): {len(lanes_tmp)}")
+                    lanes_tmp, dirs_tmp = [], []
+                    img_vis = cv2.resize(image, None, fx=self.display_scale, fy=self.display_scale, interpolation=cv2.INTER_AREA)
+                    cv2.imshow("Image", img_vis)
+                    cv2.setMouseCallback("Image", self.mouse_callback,
+                        {'img': img_vis, 'scale': self.display_scale, 'orig': image})
 
-            elif key == 13:  # Enter
-                if self.current_points:
-                    if self.current_lane_mode == "single":
-                        lanes_tmp = [self.current_points.copy()]
-                        dirs_tmp  = [direction]
-                    else:
-                        lanes_tmp.append(self.current_points.copy())
-                        dirs_tmp.append(direction)
-                break
+                elif key == ord('e'):
+                    self.snap_to_edge = not self.snap_to_edge
+                    print(f"Snap-to-edge: {'ON' if self.snap_to_edge else 'OFF'}")
 
-            elif key == ord('r'):
-                print("Redoing current frame...")
-                self.current_points = []
-                lanes_tmp, dirs_tmp = [], []
-                img_vis = cv2.resize(image, None, fx=self.display_scale, fy=self.display_scale, interpolation=cv2.INTER_AREA)
-                cv2.imshow("Image", img_vis)
-                cv2.setMouseCallback("Image", self.mouse_callback,
-                     {'img': img_vis, 'scale': self.display_scale, 'orig': image})
+                elif key == 81:  # Left
+                    direction = 'left'; print(f"Direction: {direction}")
+                elif key == 82:  # Up
+                    direction = 'up'; print(f"Direction: {direction}")
+                elif key == 83:  # Right
+                    direction = 'right'; print(f"Direction: {direction}")
+                elif key == 84:  # Down
+                    direction = 'down'; print(f"Direction: {direction}")
+                elif key == ord('+'): 
+                    self.zoom = min(8.0, self.zoom*1.25)
+                elif key == ord('-'): 
+                    self.zoom = max(0.1, self.zoom/1.25)
 
-            elif key == ord('e'):
-                self.snap_to_edge = not self.snap_to_edge
-                print(f"Snap-to-edge: {'ON' if self.snap_to_edge else 'OFF'}")
+            cv2.destroyAllWindows()
 
-            elif key == 81:  # Left
-                direction = 'left'; print(f"Direction: {direction}")
-            elif key == 82:  # Up
-                direction = 'up'; print(f"Direction: {direction}")
-            elif key == 83:  # Right
-                direction = 'right'; print(f"Direction: {direction}")
-            elif key == 84:  # Down
-                direction = 'down'; print(f"Direction: {direction}")
-            elif key == ord('+'): 
-                self.zoom = min(8.0, self.zoom*1.25)
-            elif key == ord('-'): 
-                self.zoom = max(0.1, self.zoom/1.25)
+            # Commit lanes officially to the class and write them FRESH
+            # smooth + densify each lane before saving
+            smoothed = []
+            for lane in lanes_tmp:
+                s = self._chaikin(lane, iters=2)
+                s = self._resample(s, step=6)
+                smoothed.append(s)
+            self.lanes_points = smoothed
 
-        cv2.destroyAllWindows()
+            self.lane_directions = dirs_tmp
+            
+            _write_lanes_fresh(output_file, self.lanes_points)
 
-        # Commit lanes officially to the class and write them FRESH
-        # smooth + densify each lane before saving
-        smoothed = []
-        for lane in lanes_tmp:
-            s = self._chaikin(lane, iters=2)
-            s = self._resample(s, step=6)
-            smoothed.append(s)
-        self.lanes_points = smoothed
+            meta_path = output_file.replace(".lines.txt", ".meta.json")
+            with self.logger.timer("write_frame_meta", extra={"file": os.path.basename(meta_path)}):
+                _write_frame_meta(
+                    meta_path,
+                    directions=self.lane_directions,
+                    lane_mode=self.current_lane_mode,
+                    step_size=self.step_size,
+                    adjustment_factor=self.adjustment_factor,
+                    num_lanes=len(self.lanes_points)
+                )
 
-        self.lane_directions = dirs_tmp
-        
-        _write_lanes_fresh(output_file, self.lanes_points)
 
 
     
@@ -477,90 +590,119 @@ class HybridLabeler:
         prev_points_per_lane: list of lists of points for previous frame (same structure as lanes_points)
         Returns: "ok" | "manual" | "abort", adjusted_points_per_lane
         """
-        scale = self.display_scale if hasattr(self, 'display_scale') else self._fit_scale(image)
-        img_vis = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
 
-        adjusted_points_per_lane = []   # anchor -> k (for save/draw)
-        prev_concat = []                # prev-frame points (for LK)
-        pred_concat = []                # prev points shifted by one step (for LK)
+        with self.logger.timer(
+            "propagate_annotations",
+            extra={
+                "i": int(i),
+                "k": int(k),
+                "to": os.path.basename(output_file).replace(".lines.txt", ".jpg")
+            }
+        ):
 
-        # Guard if lane counts differ; pair by index
-        num_lanes = min(len(self.lanes_points), len(prev_points_per_lane))
+            scale = self.display_scale if hasattr(self, 'display_scale') else self._fit_scale(image)
+            img_vis = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
 
-        for lane_idx in range(num_lanes):
-            direction = self.lane_directions[lane_idx] if lane_idx < len(self.lane_directions) else 'straight'
-            dx, dy = self.gamma(direction)
+            adjusted_points_per_lane = []   # anchor -> k (for save/draw)
+            prev_concat = []                # prev-frame points (for LK)
+            pred_concat = []                # prev points shifted by one step (for LK)
 
-            # A) Anchor-based propagation (anchor i -> k)  — later smoothed for save/draw
-            initial_points = self.lanes_points[lane_idx]
-            adj_anchor = self.adjust_points(initial_points, k, i, direction)
-            adjusted_points_per_lane.append(adj_anchor)
+            # Guard if lane counts differ; pair by index
+            num_lanes = min(len(self.lanes_points), len(prev_points_per_lane))
 
-            # B) Prev->next prediction for drift (same cardinality as prev points)
-            prev_pts = prev_points_per_lane[lane_idx]
-            pred_prev = [(x + dx, y + dy) for (x, y) in prev_pts]
+            for lane_idx in range(num_lanes):
+                direction = self.lane_directions[lane_idx] if lane_idx < len(self.lane_directions) else 'straight'
+                dx, dy = self.gamma(direction)
 
-            prev_concat.extend(prev_pts)
-            pred_concat.extend(pred_prev)
+                # A) Anchor-based propagation (anchor i -> k)  — later smoothed for save/draw
+                initial_points = self.lanes_points[lane_idx]
+                adj_anchor = self.adjust_points(initial_points, k, i, direction)
+                adjusted_points_per_lane.append(adj_anchor)
 
-        # ---- Smooth/densify ONLY the anchor-based curves (for save/draw preview) ----
-        for idx in range(len(adjusted_points_per_lane)):
-            s = self._chaikin(adjusted_points_per_lane[idx], iters=2)
-            s = self._resample(s, step=6)
-            adjusted_points_per_lane[idx] = s
+                # B) Prev->next prediction for drift (same cardinality as prev points)
+                prev_pts = prev_points_per_lane[lane_idx]
+                pred_prev = [(x + dx, y + dy) for (x, y) in prev_pts]
 
-        # If single-lane mode, keep the longest propagated lane
-        if self.current_lane_mode == "single" and len(adjusted_points_per_lane) > 1:
-            adjusted_points_per_lane.sort(key=len, reverse=True)
-            adjusted_points_per_lane = [adjusted_points_per_lane[0]]
+                prev_concat.extend(prev_pts)
+                pred_concat.extend(pred_prev)
 
-        # Overwrite the .lines.txt once (fresh)
-        _write_lanes_fresh(output_file, adjusted_points_per_lane)
+            # ---- Smooth/densify ONLY the anchor-based curves (for save/draw preview) ----
+            for idx in range(len(adjusted_points_per_lane)):
+                s = self._chaikin(adjusted_points_per_lane[idx], iters=2)
+                s = self._resample(s, step=6)
+                adjusted_points_per_lane[idx] = s
 
-        if not os.path.exists(output_file) or len(_read_lanes(output_file)) != len(adjusted_points_per_lane):
-            print(f"Warning: mismatch writing {output_file}")
+            # If single-lane mode, keep the longest propagated lane
+            if self.current_lane_mode == "single" and len(adjusted_points_per_lane) > 1:
+                adjusted_points_per_lane.sort(key=len, reverse=True)
+                adjusted_points_per_lane = [adjusted_points_per_lane[0]]
 
-        # ---- Preview (draw smooth polylines) ----
-        for lane in adjusted_points_per_lane:
-            if len(lane) >= 2:
-                pts = np.array([(int(x*scale), int(y*scale)) for x, y in lane], np.int32)
-                cv2.polylines(img_vis, [pts], isClosed=False, color=(0,255,0), thickness=4, lineType=cv2.LINE_AA)
+            _write_lanes_fresh(output_file, adjusted_points_per_lane)
 
-        # ---- DRIFT on matching lengths (prev_concat vs pred_concat) ----
-        drift = self._estimate_drift(prev_image, image, prev_concat, pred_concat)
+            meta_path = output_file.replace(".lines.txt", ".meta.json")
+            with self.logger.timer("write_frame_meta", extra={"file": os.path.basename(meta_path)}):
+                _write_frame_meta(
+                    meta_path,
+                    directions=self.lane_directions[:len(adjusted_points_per_lane)],
+                    lane_mode=self.current_lane_mode,
+                    step_size=self.step_size,
+                    adjustment_factor=self.adjustment_factor,
+                    num_lanes=len(adjusted_points_per_lane)
+                )
 
-        # Adaptive threshold (tight when motion small, relaxed when motion large)
-        base = float(self.drift_threshold_px)
-        mag = 1.0
-        if prev_points_per_lane and prev_points_per_lane[0] and len(prev_points_per_lane[0]) >= 2:
-            arr = np.array(prev_points_per_lane[0], dtype=np.float32)
-            diffs = np.diff(arr, axis=0)
-            step_mags = np.linalg.norm(diffs, axis=1)
-            if step_mags.size:
-                mag = float(np.median(step_mags))
-        thresh = float(np.clip(base * (1.0 + 0.5 * (mag / 3.0)), 4.0, 20.0))
-        self.last_drift_threshold = thresh
 
-        if drift > thresh:
-            cv2.putText(img_vis,
-                        f"DRIFT {drift:.1f}px  thr~{thresh:.1f}  [m]=manual  [c]=continue  [q]=abort",
-                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
 
-        # Show window then wait using the ADAPTIVE threshold
-        cv2.namedWindow("Automated Frame", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Automated Frame",
-                        min(int(image.shape[1] * scale), self.max_window_size[0]),
-                        min(int(image.shape[0] * scale), self.max_window_size[1]))
-        cv2.imshow("Automated Frame", img_vis)
+            if not os.path.exists(output_file) or len(_read_lanes(output_file)) != len(adjusted_points_per_lane):
+                print(f"Warning: mismatch writing {output_file}")
 
-        wait = 1000 if drift > thresh else self.pause_ms
-        key = cv2.waitKey(wait) & 0xFF
+            # ---- Preview (draw smooth polylines) ----
+            for lane in adjusted_points_per_lane:
+                if len(lane) >= 2:
+                    pts = np.array([(int(x*scale), int(y*scale)) for x, y in lane], np.int32)
+                    cv2.polylines(img_vis, [pts], isClosed=False, color=(0,255,0), thickness=4, lineType=cv2.LINE_AA)
 
-        if key in (ord('q'), 27):  # q or ESC
-            return "abort", adjusted_points_per_lane
-        if key == ord('m'):        # switch to manual on this frame
-            return "manual", adjusted_points_per_lane
-        return "ok", adjusted_points_per_lane
+            # ---- DRIFT on matching lengths (prev_concat vs pred_concat) ----
+            drift = self._estimate_drift(prev_image, image, prev_concat, pred_concat)
+
+            # Adaptive threshold (tight when motion small, relaxed when motion large)
+            base = float(self.drift_threshold_px)
+            mag = 1.0
+            if prev_points_per_lane and prev_points_per_lane[0] and len(prev_points_per_lane[0]) >= 2:
+                arr = np.array(prev_points_per_lane[0], dtype=np.float32)
+                diffs = np.diff(arr, axis=0)
+                step_mags = np.linalg.norm(diffs, axis=1)
+                if step_mags.size:
+                    mag = float(np.median(step_mags))
+            thresh = float(np.clip(base * (1.0 + 0.5 * (mag / 3.0)), 4.0, 20.0))
+            self.last_drift_threshold = thresh
+            self.logger.events.append({
+            "name": "propagate_annotations:drift",
+            "t_start": self.logger._now_iso(),
+            "t_end": self.logger._now_iso(),
+            "secs": 0.0,
+            "extra": {"drift_px": float(drift), "drift_thr_px": float(thresh)}
+            })
+            self.logger._flush()
+            if drift > thresh:
+                cv2.putText(img_vis,
+                            f"DRIFT {drift:.1f}px  thr~{thresh:.1f}  [m]=manual  [c]=continue  [q]=abort",
+                            (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
+
+            # Show window then wait using the ADAPTIVE threshold
+            cv2.namedWindow("Automated Frame", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("Automated Frame",
+                            min(int(image.shape[1] * scale), self.max_window_size[0]),
+                            min(int(image.shape[0] * scale), self.max_window_size[1]))
+            cv2.imshow("Automated Frame", img_vis)
+
+            wait = 1000 if drift > thresh else self.pause_ms
+            key = cv2.waitKey(wait) & 0xFF
+
+            if key in (ord('q'), 27):  # q or ESC
+                return "abort", adjusted_points_per_lane
+            if key == ord('m'):        # switch to manual on this frame
+                return "manual", adjusted_points_per_lane
+            return "ok", adjusted_points_per_lane
 
 
     
@@ -596,15 +738,16 @@ class HybridLabeler:
 
             # If this anchor already has annotations and we're resuming, load them; else collect manually
             existing = _read_lanes(out_i) if resume else []
-            if existing:
-                print("Existing annotations found for anchor; using them.")
-                self.lanes_points = existing
-                # no stored directions on disk; default to 'straight'
-                self.lane_directions = ['straight'] * len(existing)
-            else:
-                self.lanes_points = []
-                self.lane_directions = []
-                self.manual_annotation(image, out_i)  # writes fresh
+            with self.logger.timer("anchor_frame", extra={"frame": files[i]}):
+                if existing:
+                    print("Existing annotations found for anchor; using them.")
+                    self.lanes_points = existing
+                    # no stored directions on disk; default to 'straight'
+                    self.lane_directions = ['straight'] * len(existing)
+                else:
+                    self.lanes_points = []
+                    self.lane_directions = []
+                    self.manual_annotation(image, out_i)  # writes fresh
 
             # Prepare prev refs from anchor
             prev_image = image
@@ -630,10 +773,10 @@ class HybridLabeler:
                 # Otherwise, propagate now
                 scale = self.display_scale if hasattr(self, 'display_scale') else self._fit_scale(next_image)
                 img_vis = cv2.resize(next_image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-
-                status, adjusted_points_per_lane = self.propagate_annotations(
-                    next_image, prev_image, prev_points_per_lane, i, k, out_k  # out_k is written inside
-                )
+                with self.logger.timer("propagate_step", extra={"from": files[i], "to": files[k]}):
+                    status, adjusted_points_per_lane = self.propagate_annotations(
+                        next_image, prev_image, prev_points_per_lane, i, k, out_k  # out_k is written inside
+                    )
 
                 if status == "abort":
                     cv2.destroyAllWindows()
@@ -688,52 +831,58 @@ class HybridLabeler:
         
         with open(output_list_file, 'w') as out_list:
             for img_path in image_paths:
+
                 if image_list_file:
                     full_image_path = os.path.join(base_dir, img_path)
                 else:
                     full_image_path = os.path.join(base_dir, img_path)
                 
                 annotation_file = os.path.join(annotations_dir, 
-                                              os.path.basename(img_path).replace('.jpg', '.lines.txt'))
-                
-                # Load image
-                image = cv2.imread(full_image_path)
-                if image is None:
-                    print(f"Warning: Could not load image {full_image_path}")
-                    continue
-                
-                # Create single-channel mask once per image
-                h, w = image.shape[:2]
-                mask = np.zeros((h, w), dtype=np.uint8)
+                                            os.path.basename(img_path).replace('.jpg', '.lines.txt'))
+                with self.logger.timer("generate_segmentation_masks:image",extra={"image": os.path.basename(full_image_path)}):
+                    annotation_file = os.path.join(
+                        annotations_dir,
+                        os.path.basename(img_path).replace('.jpg', '.lines.txt')
+                    )
+    
+                    # Load image
+                    image = cv2.imread(full_image_path)
+                    if image is None:
+                        print(f"Warning: Could not load image {full_image_path}")
+                        continue
+                    
+                    # Create single-channel mask once per image
+                    h, w = image.shape[:2]
+                    mask = np.zeros((h, w), dtype=np.uint8)
 
-                if os.path.exists(annotation_file):
-                    with open(annotation_file, 'r') as f:
-                        for lane_idx, line in enumerate(f):
-                            points = line.strip().split()
-                            if len(points) < 4:
-                                continue
+                    if os.path.exists(annotation_file):
+                        with open(annotation_file, 'r') as f:
+                            for lane_idx, line in enumerate(f):
+                                points = line.strip().split()
+                                if len(points) < 4:
+                                    continue
 
-                            # Extract + optional smooth/resample for cleaner masks
-                            point_coords = []
-                            for i_pt in range(0, len(points), 2):
-                                x = int(round(float(points[i_pt])))
-                                y = int(round(float(points[i_pt+1])))
-                                point_coords.append((x, y))
-                            if self.smooth_masks:
-                                point_coords = self._chaikin(point_coords, iters=2)
-                                point_coords = self._resample(point_coords, step=4)
+                                # Extract + optional smooth/resample for cleaner masks
+                                point_coords = []
+                                for i_pt in range(0, len(points), 2):
+                                    x = int(round(float(points[i_pt])))
+                                    y = int(round(float(points[i_pt+1])))
+                                    point_coords.append((x, y))
+                                if self.smooth_masks:
+                                    point_coords = self._chaikin(point_coords, iters=2)
+                                    point_coords = self._resample(point_coords, step=4)
 
-                            # Draw lane into the SAME mask
-                            for j in range(len(point_coords) - 1):
-                                pt1, pt2 = point_coords[j], point_coords[j+1]
-                                if (0 <= pt1[0] < w and 0 <= pt1[1] < h and
-                                    0 <= pt2[0] < w and 0 <= pt2[1] < h):
-                                    cv2.line(mask, pt1, pt2, 255, 5, lineType=cv2.LINE_AA)
+                                # Draw lane into the SAME mask
+                                for j in range(len(point_coords) - 1):
+                                    pt1, pt2 = point_coords[j], point_coords[j+1]
+                                    if (0 <= pt1[0] < w and 0 <= pt1[1] < h and
+                                        0 <= pt2[0] < w and 0 <= pt2[1] < h):
+                                        cv2.line(mask, pt1, pt2, 255, 5, lineType=cv2.LINE_AA)
 
-                # Save mask (Line 19)
-                mask_filename = os.path.join(mask_dir, 
-                                            os.path.basename(full_image_path).replace('.jpg', '.png'))
-                cv2.imwrite(mask_filename, mask)
+                    # Save mask (Line 19)
+                    mask_filename = os.path.join(mask_dir, 
+                                                os.path.basename(full_image_path).replace('.jpg', '.png'))
+                    cv2.imwrite(mask_filename, mask)
                 
                 # Write to output list
                 if image_list_file:
@@ -749,30 +898,35 @@ def main():
     Example usage of the hybrid labeling algorithm.
     """
     # Configuration
-    input_dir = 'E:\\ExtractedFrames\\GX010009'
-    output_dir = 'E:\\ExtractedFrames\\GX010009\\annotations'
+    input_dir = 'D:\\PhDWork\\GX010009'
+    output_dir = 'D:\\PhDWork\\GX010009\\annotations'
     step_size = 60  # σ in Algorithm 1
     adjustment_factor = 1.5  # Scaling for γ(δ)
     
     # Initialize labeler
-    labeler = HybridLabeler(step_size=step_size, adjustment_factor=adjustment_factor)
-    
-    # Phase 1: Process image sequence with hybrid labeling (Lines 1-13)
-    print("=" * 60)
-    print("Phase 1: Hybrid Interactive and Automated Labeling")
-    print("=" * 60)
-    labeler.process_image_sequence(input_dir, output_dir)
-    
-    # Phase 2: Generate segmentation masks (Lines 14-19)
-    print("\n" + "=" * 60)
-    print("Phase 2: Segmentation Mask Generation")
-    print("=" * 60)
-    mask_output_dir = 'E:\\ExtractedFrames\\GX010009\\segmentation_masks'
-    labeler.generate_segmentation_masks(
-        base_dir='E:\\ExtractedFrames\\GX010009',
-        annotations_dir=output_dir,
-        output_dir=mask_output_dir
-    )
+    labeler = HybridLabeler(step_size=step_size, adjustment_factor=adjustment_factor, log_dir=os.path.join(output_dir, "logs"))
+    labeler.logger.begin_session(labeler.log_dir)
+
+    # Phase 1
+    with labeler.logger.timer("process_image_sequence", extra={"input_dir": input_dir, "output_dir": output_dir}):
+        print("=" * 60)
+        print("Phase 1: Hybrid Interactive and Automated Labeling")
+        print("=" * 60)
+        labeler.process_image_sequence(input_dir, output_dir)
+
+    # Phase 2
+    with labeler.logger.timer("generate_segmentation_masks"):
+        print("\n" + "=" * 60)
+        print("Phase 2: Segmentation Mask Generation")
+        print("=" * 60)
+        mask_output_dir = 'D:\\PhDWork\\GX010009\\segmentation_masks'
+        labeler.generate_segmentation_masks(
+            base_dir='D:\\PhDWork\\GX010009',
+            annotations_dir=output_dir,
+            output_dir=mask_output_dir
+        )
+
+    labeler.logger.end_session()    
     
     print("\n" + "=" * 60)
     print("Hybrid labeling completed successfully!")
