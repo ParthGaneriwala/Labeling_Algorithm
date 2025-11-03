@@ -396,9 +396,12 @@ class HybridLabeler:
             print("  - Arrow keys: Set direction (Left/Right/Up/Down, default: Straight)")
             print("  - 'r': Redo current frame")
             print("  - Enter: Finish and write annotations")
-
+            KEY_LEFT  = 2424832
+            KEY_UP    = 2490368
+            KEY_RIGHT = 2555904
+            KEY_DOWN  = 2621440
             while True:
-                key = cv2.waitKey(0) & 0xFF
+                key = cv2.waitKeyEx(0)
 
                 if key == ord('1'):
                     self.current_lane_mode = "single"
@@ -442,14 +445,14 @@ class HybridLabeler:
                     self.snap_to_edge = not self.snap_to_edge
                     print(f"Snap-to-edge: {'ON' if self.snap_to_edge else 'OFF'}")
 
-                elif key == 81:  # Left
-                    direction = 'left'; print(f"Direction: {direction}")
-                elif key == 82:  # Up
-                    direction = 'up'; print(f"Direction: {direction}")
-                elif key == 83:  # Right
-                    direction = 'right'; print(f"Direction: {direction}")
-                elif key == 84:  # Down
-                    direction = 'down'; print(f"Direction: {direction}")
+                elif key == KEY_LEFT:
+                    direction = 'left'; print("Direction: left")
+                elif key == KEY_UP:
+                    direction = 'up'; print("Direction: up")
+                elif key == KEY_RIGHT:
+                    direction = 'right'; print("Direction: right")
+                elif key == KEY_DOWN:
+                    direction = 'down'; print("Direction: down")
                 elif key == ord('+'): 
                     self.zoom = min(8.0, self.zoom*1.25)
                 elif key == ord('-'): 
