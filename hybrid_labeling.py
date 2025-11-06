@@ -24,17 +24,17 @@ import math
 import uuid
 from datetime import datetime, timezone
 
-# --- NEW: Telemetry logger -----------------------------------------------
+# --- NEW: Telemetry logger (fast, durable) --------------------------------
 class _TelemetryLogger:
     """
     Lightweight session & function timing logger that writes a single JSON per run.
-    Usage:
-        self.logger.begin_session(log_dir)
-        with self.logger.timer("manual_annotation", extra={...}):
-            ...
-        self.logger.end_session()
+
+    Improvements:
+    - UTF-8 writes (Windows-safe)
+    - Rate-limited flushing (huge speed win)
+    - Clean 'ended_at' on Ctrl+C / process exit via atexit/signal hooks
     """
-    def __init__(self, log_dir=None):
+    def __init__(self, log_dir=None, flush_every=50, flush_interval_sec=2.0):
         self.session_id = None
         self.started_at = None
         self.ended_at = None
@@ -43,37 +43,50 @@ class _TelemetryLogger:
         self.log_dir = log_dir
         self._outfile = None
 
+        # rate-limit controls
+        self.flush_every = int(flush_every)
+        self.flush_interval_sec = float(flush_interval_sec)
+        self._events_since_flush = 0
+        self._last_flush_time = 0.0
+
     def _now_iso(self):
-        return datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     def begin_session(self, log_dir):
         os.makedirs(log_dir, exist_ok=True)
         self.log_dir = log_dir
         self.session_id = uuid.uuid4().hex
         self.started_at = self._now_iso()
-        # use local time for the filename stamp for readability
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._outfile = os.path.join(log_dir, f"session_{stamp}_{self.session_id[:6]}.json")
-        self._flush()  # create the file early
+        self._flush_maybe(force=True)  # create the file early
 
     def end_session(self):
-        self.ended_at = self._now_iso()
-        self._flush()
+        # Idempotent: safe to call multiple times
+        if self._outfile and (self.ended_at is None):
+            self.ended_at = self._now_iso()
+        self._flush_maybe(force=True)
 
-    def _flush(self):
+    def _flush_maybe(self, force=False):
+        from time import perf_counter
         if not self._outfile:
             return
-        payload = {
-            "session_id": self.session_id,
-            "started_at": self.started_at,
-            "ended_at": self.ended_at,
-            "totals_sec": {k: round(v, 6) for k, v in self.totals.items()},
-            "events": self.events,
-        }
-        tmp = self._outfile + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(payload, f, indent=2)
-        os.replace(tmp, self._outfile)
+        now = perf_counter()
+        if force or (self._events_since_flush >= self.flush_every) or ((now - self._last_flush_time) >= self.flush_interval_sec):
+            payload = {
+                "session_id": self.session_id,
+                "started_at": self.started_at,
+                "ended_at": self.ended_at,
+                "totals_sec": {k: round(v, 6) for k, v in self.totals.items()},
+                "events": self.events,
+            }
+            tmp = self._outfile + ".tmp"
+            # UTF-8 avoids Windows cp1252 hiccups if you interrupt while writing
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            os.replace(tmp, self._outfile)
+            self._events_since_flush = 0
+            self._last_flush_time = now
 
     class _TimerCtx:
         def __init__(self, parent, name, extra=None):
@@ -98,10 +111,21 @@ class _TelemetryLogger:
             }
             self.parent.events.append(evt)
             self.parent.totals[self.name] = self.parent.totals.get(self.name, 0.0) + secs
-            self.parent._flush()
+            self.parent._events_since_flush += 1
+            self.parent._flush_maybe()
 
     def timer(self, name, extra=None):
         return self._TimerCtx(self, name, extra)
+# --------------------------------------------------------------------------
+
+def _file_mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return -1.0
+
+def _mask_path_for_image(mask_dir, image_path):
+    return os.path.join(mask_dir, os.path.basename(image_path).replace('.jpg', '.png'))
 
 # --- NEW: helper to write per-frame meta JSON -----------------------------
 def _write_frame_meta(meta_path, directions, lane_mode, step_size, adjustment_factor, num_lanes=None, extra=None):
@@ -203,7 +227,7 @@ class HybridLabeler:
         return scale
     
     def _snap_to_edge(self, orig_img, x, y, pts, normal_search=24, roi_half=16,
-                  canny1=50, canny2=150):
+                canny1=50, canny2=150):
         """
         Refine (x,y) to the strongest edge near the local *normal* direction.
         - If we have at least 2 prior points, compute tangent from the last segment
@@ -301,7 +325,7 @@ class HybridLabeler:
         # Compute per-point error between flow result and predicted location
         diffs = np.linalg.norm(good_flow - predicted_good, axis=1)
         return _median(diffs.tolist())
-       
+    
     def gamma(self, direction):
         """
         Directional translation function γ(δ) from Algorithm 1.
@@ -685,7 +709,7 @@ class HybridLabeler:
             "secs": 0.0,
             "extra": {"drift_px": float(drift), "drift_thr_px": float(thresh)}
             })
-            self.logger._flush()
+            self.logger._flush_maybe()
             if drift > thresh:
                 cv2.putText(img_vis,
                             f"DRIFT {drift:.1f}px  thr~{thresh:.1f}  [m]=manual  [c]=continue  [q]=abort",
@@ -805,56 +829,84 @@ class HybridLabeler:
             if not jumped_to_manual:
                 i += self.step_size
     
-    def generate_segmentation_masks(self, base_dir, annotations_dir, output_dir, image_list_file=None):
+    def generate_segmentation_masks(
+        self,
+        base_dir,
+        annotations_dir,
+        output_dir,
+        image_list_file=None,
+        only_missing=True,           # NEW: skip masks that already exist
+        update_if_older=True,        # NEW: rebuild if annotation is newer than mask
+        dry_run=False                # NEW: preview what would be built
+    ):
         """
-        Generate segmentation masks M_i from lane points (Lines 14-19 in Algorithm 1).
-        
-        Implements mask generation: M_i(x,y) = 1 if (x,y) in lane segment, 0 otherwise
-        
-        Args:
-            base_dir (str): Base directory containing images
-            annotations_dir (str): Directory with .lines.txt annotation files
-            output_dir (str): Directory to save segmentation masks
-            image_list_file (str): Optional file listing images to process
+        Generate segmentation masks M_i from lane points.
+
+        New behavior:
+        - only_missing=True: only create masks that don't exist yet
+        - update_if_older=True: if a mask exists but its mtime < annotation mtime, rebuild it
+        - dry_run=True: don't write anything; just print planned actions
         """
         mask_dir = os.path.join(output_dir, 'images')
         os.makedirs(mask_dir, exist_ok=True)
-        
-        # Get list of images to process
+
+        # Determine images to process
         if image_list_file and os.path.exists(image_list_file):
             with open(image_list_file, 'r') as f:
                 image_paths = [line.strip() for line in f.readlines()]
         else:
-            # Process all images in annotations directory
-            image_paths = [f.replace('.lines.txt', '.jpg') 
-                          for f in os.listdir(annotations_dir) 
-                          if f.endswith('.lines.txt')]
-        
-        output_list_file = os.path.join(output_dir, 'segmentation_list.txt')
-        
-        with open(output_list_file, 'w') as out_list:
-            for img_path in image_paths:
+            image_paths = [
+                f.replace('.lines.txt', '.jpg')
+                for f in os.listdir(annotations_dir)
+                if f.endswith('.lines.txt')
+            ]
 
-                if image_list_file:
-                    full_image_path = os.path.join(base_dir, img_path)
-                else:
-                    full_image_path = os.path.join(base_dir, img_path)
-                
-                annotation_file = os.path.join(annotations_dir, 
-                                            os.path.basename(img_path).replace('.jpg', '.lines.txt'))
-                with self.logger.timer("generate_segmentation_masks:image",extra={"image": os.path.basename(full_image_path)}):
-                    annotation_file = os.path.join(
-                        annotations_dir,
-                        os.path.basename(img_path).replace('.jpg', '.lines.txt')
-                    )
-    
-                    # Load image
+        output_list_file = os.path.join(output_dir, 'segmentation_list.txt')
+        planned = []  # collect for dry_run or list writing
+
+        with open(output_list_file, 'w') as out_list:
+            for idx, img_path in enumerate(image_paths, start=1):
+                full_image_path = os.path.join(base_dir, img_path)
+                annotation_file = os.path.join(
+                    annotations_dir,
+                    os.path.basename(img_path).replace('.jpg', '.lines.txt')
+                )
+                mask_filename = _mask_path_for_image(mask_dir, full_image_path)
+
+                # Lightweight progress ping (max every ~2s due to rate limiter)
+                if (idx % 100) == 0:
+                    self.logger.events.append({
+                        "name": "generate_segmentation_masks:progress",
+                        "t_start": self.logger._now_iso(),
+                        "t_end": self.logger._now_iso(),
+                        "secs": 0.0,
+                        "extra": {"done": idx, "total": len(image_paths)}
+                    })
+                    self.logger._events_since_flush += 1
+                    self.logger._flush_maybe()
+
+                # Decide whether to build this mask
+                ann_time = _file_mtime(annotation_file)
+                mask_time = _file_mtime(mask_filename)
+
+                exists = os.path.exists(mask_filename)
+                is_outdated = exists and (ann_time > mask_time + 1e-6) if update_if_older else False
+
+                if only_missing and exists and not is_outdated:
+                    # Already up-to-date, skip
+                    continue
+
+                if dry_run:
+                    print(f"[DRY RUN] Would generate: {os.path.basename(mask_filename)}")
+                    planned.append((img_path, os.path.relpath(mask_filename, base_dir)))
+                    continue
+
+                with self.logger.timer("generate_segmentation_masks:image", extra={"image": os.path.basename(full_image_path)}):
                     image = cv2.imread(full_image_path)
                     if image is None:
                         print(f"Warning: Could not load image {full_image_path}")
                         continue
-                    
-                    # Create single-channel mask once per image
+
                     h, w = image.shape[:2]
                     mask = np.zeros((h, w), dtype=np.uint8)
 
@@ -864,8 +916,6 @@ class HybridLabeler:
                                 points = line.strip().split()
                                 if len(points) < 4:
                                     continue
-
-                                # Extract + optional smooth/resample for cleaner masks
                                 point_coords = []
                                 for i_pt in range(0, len(points), 2):
                                     x = int(round(float(points[i_pt])))
@@ -875,64 +925,105 @@ class HybridLabeler:
                                     point_coords = self._chaikin(point_coords, iters=2)
                                     point_coords = self._resample(point_coords, step=4)
 
-                                # Draw lane into the SAME mask
                                 for j in range(len(point_coords) - 1):
                                     pt1, pt2 = point_coords[j], point_coords[j+1]
                                     if (0 <= pt1[0] < w and 0 <= pt1[1] < h and
                                         0 <= pt2[0] < w and 0 <= pt2[1] < h):
                                         cv2.line(mask, pt1, pt2, 255, 5, lineType=cv2.LINE_AA)
 
-                    # Save mask (Line 19)
-                    mask_filename = os.path.join(mask_dir, 
-                                                os.path.basename(full_image_path).replace('.jpg', '.png'))
+                    os.makedirs(os.path.dirname(mask_filename), exist_ok=True)
                     cv2.imwrite(mask_filename, mask)
-                
-                # Write to output list
+
+                # Write paired list entry (use same format as before)
                 if image_list_file:
                     out_list.write(f"{img_path} {os.path.relpath(mask_filename, base_dir)}\n")
                 else:
                     out_list.write(f"{os.path.basename(img_path)} {os.path.basename(mask_filename)}\n")
-        
-        print(f"Segmentation masks saved to {mask_dir}")
+
+        if dry_run:
+            print(f"[DRY RUN] Planned masks: {len(planned)}")
+        print(f"Segmentation masks saved to {os.path.join(output_dir, 'images')}")
         print(f"Output list saved to {output_list_file}")
 
+
 def main():
-    """
-    Example usage of the hybrid labeling algorithm.
-    """
-    # Configuration
-    input_dir = 'D:\\PhDWork\\GX010009'
-    output_dir = 'D:\\PhDWork\\GX010009\\annotations'
-    step_size = 60  # σ in Algorithm 1
-    adjustment_factor = 1.5  # Scaling for γ(δ)
-    
-    # Initialize labeler
-    labeler = HybridLabeler(step_size=step_size, adjustment_factor=adjustment_factor, log_dir=os.path.join(output_dir, "logs"))
+    import argparse, atexit, signal, sys
+
+    parser = argparse.ArgumentParser(description="Hybrid labeling + on-demand segmentation")
+    parser.add_argument("--input_dir", default="D:\\PhDWork\\GX010009")
+    parser.add_argument("--output_dir", default="D:\\PhDWork\\GX010009\\annotations")
+    parser.add_argument("--masks_out", default="D:\\PhDWork\\GX010009\\segmentation_masks")
+    parser.add_argument("--step_size", type=int, default=60)
+    parser.add_argument("--adjustment_factor", type=float, default=1.5)
+    parser.add_argument("--mode", choices=["label", "masks", "all"], default="label",
+                        help="'label' = labeling only, 'masks' = segmentation only, 'all' = do both")
+
+    # Defaults ON; you can turn them off with --no-only-missing / --no-update-if-older (Py3.9+)
+    parser.add_argument("--only-missing", dest="only_missing",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Generate only missing or outdated masks (default: True)")
+    parser.add_argument("--update-if-older", dest="update_if_older",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Rebuild existing masks if annotation is newer (default: True)")
+
+    parser.add_argument("--dry_run", action="store_true",
+                        help="Mask generation dry-run (print what would be built)")
+    parser.add_argument("--no_resume", action="store_true",
+                        help="Disable resume behavior for labeling")
+    args = parser.parse_args()
+
+    labeler = HybridLabeler(
+        step_size=args.step_size,
+        adjustment_factor=args.adjustment_factor,
+        log_dir=os.path.join(args.output_dir, "logs"),
+    )
     labeler.logger.begin_session(labeler.log_dir)
 
-    # Phase 1
-    with labeler.logger.timer("process_image_sequence", extra={"input_dir": input_dir, "output_dir": output_dir}):
-        print("=" * 60)
-        print("Phase 1: Hybrid Interactive and Automated Labeling")
-        print("=" * 60)
-        labeler.process_image_sequence(input_dir, output_dir)
+    # Clean shutdown: ensure ended_at is written on exit / Ctrl+C
+    def _graceful_exit(signum=None, frame=None):
+        try:
+            labeler.logger.end_session()
+        finally:
+            # 130 is conventional exit code for SIGINT
+            sys.exit(130 if signum in (signal.SIGINT, signal.SIGTERM) else 0)
 
-    # Phase 2
-    with labeler.logger.timer("generate_segmentation_masks"):
-        print("\n" + "=" * 60)
-        print("Phase 2: Segmentation Mask Generation")
-        print("=" * 60)
-        mask_output_dir = 'D:\\PhDWork\\GX010009\\segmentation_masks'
-        labeler.generate_segmentation_masks(
-            base_dir='D:\\PhDWork\\GX010009',
-            annotations_dir=output_dir,
-            output_dir=mask_output_dir
-        )
+    atexit.register(labeler.logger.end_session)
+    try:
+        signal.signal(signal.SIGINT, _graceful_exit)
+        signal.signal(signal.SIGTERM, _graceful_exit)
+    except Exception:
+        # Some environments (e.g., certain IDEs) may not allow signal binding
+        pass
 
-    labeler.logger.end_session()    
-    
+    print("=" * 60)
+    print(f"Mode: {args.mode}")
+    print("=" * 60)
+
+    if args.mode in ("label", "all"):
+        with labeler.logger.timer("process_image_sequence", extra={"input_dir": args.input_dir, "output_dir": args.output_dir}):
+            print("=" * 60)
+            print("Phase 1: Hybrid Interactive and Automated Labeling")
+            print("=" * 60)
+            labeler.process_image_sequence(args.input_dir, args.output_dir, resume=not args.no_resume)
+
+    if args.mode in ("masks", "all"):
+        with labeler.logger.timer("generate_segmentation_masks"):
+            print("\n" + "=" * 60)
+            print("Phase 2: Segmentation Mask Generation")
+            print("=" * 60)
+            labeler.generate_segmentation_masks(
+                base_dir=args.input_dir,
+                annotations_dir=args.output_dir,
+                output_dir=args.masks_out,
+                only_missing=args.only_missing,          # <-- respects flag/default
+                update_if_older=args.update_if_older,    # <-- respects flag/default
+                dry_run=args.dry_run
+            )
+
+    labeler.logger.end_session()
+
     print("\n" + "=" * 60)
-    print("Hybrid labeling completed successfully!")
+    print("Done.")
     print("=" * 60)
 
 

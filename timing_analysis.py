@@ -41,18 +41,23 @@ MANUAL_EVENTS = {
 # Automated processing / IO:
 AUTO_EVENTS = {
     "propagate_annotations",
-    "propagate_step",
     "propagate_annotations:drift",
-    "generate_segmentation_masks",
     "generate_segmentation_masks:image",
     "write_frame_meta",
 }
 
+
 # Wrapper/umbrella events that overlap sub-steps; exclude from category sums
 # to avoid double-counting. (Wall time still captures end-to-end.)
+# Wrapper/umbrella events that overlap sub-steps; exclude from category sums
 EXCLUDE_FROM_CATEGORY_TOTALS = {
-    "process_image_sequence"
+    "process_image_sequence",
+    "anchor_frame",                    # wraps manual work and/or reuse
+    "propagate_step",                  # wraps propagate_annotations(...)
+    "generate_segmentation_masks",     # wraps per-image mask timers
+    "generate_segmentation_masks:progress",  # heartbeat, secs=0 but be explicit
 }
+
 
 # Events whose extras may contain image/file identifiers
 IMAGE_ID_KEYS = ("file", "image", "from", "to", "frame")
